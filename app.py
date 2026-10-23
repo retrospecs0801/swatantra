@@ -102,7 +102,11 @@ if "chat_answer" not in st.session_state:
 if "active_files" not in st.session_state:
     st.session_state.active_files = []
 if "selected_request" not in st.session_state:
-    st.session_state.selected_request = ""
+    st.session_state.selected_request = "Compare this quarterly report against the SOP and generate a gap register."
+if "generated_deliverables" not in st.session_state:
+    st.session_state.generated_deliverables = {}
+if "workflow_type" not in st.session_state:
+    st.session_state.workflow_type = None
 
 
 # ---------------------------------------------------------------------------
@@ -216,20 +220,25 @@ col_p1, col_p2, col_p3, col_p4 = st.columns(4)
 with col_p1:
     if st.button("📄 Compare vs SOP", use_container_width=True):
         st.session_state.selected_request = "Compare this quarterly report against the SOP and generate a gap register."
+        st.rerun()
 with col_p2:
     if st.button("🔍 Check Compliance", use_container_width=True):
         st.session_state.selected_request = "Check this report for compliance gaps and provide evidence and recommended actions."
+        st.rerun()
 with col_p3:
     if st.button("📝 Summarize Report", use_container_width=True):
         st.session_state.selected_request = "Summarize this report in five bullet points."
+        st.rerun()
 with col_p4:
     if st.button("🛡️ Zero-Trust Chat", use_container_width=True):
         st.session_state.selected_request = "Explain zero-trust architecture."
+        st.rerun()
 
 user_request = st.text_area(
     "Enter your request in natural language:",
-    value=st.session_state.selected_request or "Compare this quarterly report against the SOP and generate a gap register.",
+    value=st.session_state.selected_request,
     height=80,
+    placeholder="Enter your request in natural language (e.g., Compare report vs SOP, or ask a general chat question)...",
     help="Type any natural language instruction. In Auto mode, the local model determines the workflow.",
 )
 
@@ -237,13 +246,17 @@ col_plan_btn, col_clear_btn = st.columns([1, 5])
 with col_plan_btn:
     generate_plan = st.button("🎯 Generate Plan", type="primary", use_container_width=True)
 with col_clear_btn:
-    if st.button("Reset State", use_container_width=False):
+    if st.button("Reset State", use_container_width=False, help="Clear request, execution results, findings, and deliverables."):
         st.session_state.current_plan = None
         st.session_state.validation_result = None
         st.session_state.execution_result = None
         st.session_state.execution_events = []
         st.session_state.findings_data = None
         st.session_state.chat_answer = None
+        st.session_state.generated_deliverables = {}
+        st.session_state.workflow_type = None
+        st.session_state.selected_request = ""
+        st.session_state.run_dir = None
         st.rerun()
 
 
@@ -294,6 +307,8 @@ if generate_plan and user_request:
         st.session_state.execution_events = []
         st.session_state.findings_data = None
         st.session_state.chat_answer = None
+        st.session_state.generated_deliverables = {}
+        st.session_state.workflow_type = None
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +354,12 @@ if st.session_state.current_plan:
             if st.button("❌ Reject / Cancel", use_container_width=False):
                 st.session_state.current_plan = None
                 st.session_state.validation_result = None
+                st.session_state.execution_result = None
+                st.session_state.execution_events = []
+                st.session_state.findings_data = None
+                st.session_state.chat_answer = None
+                st.session_state.generated_deliverables = {}
+                st.session_state.workflow_type = None
                 st.rerun()
 
         # -------------------------------------------------------------------
@@ -347,6 +368,10 @@ if st.session_state.current_plan:
         if execute_button:
             st.session_state.execution_events = []
             st.session_state.execution_result = None
+            st.session_state.findings_data = None
+            st.session_state.chat_answer = None
+            st.session_state.generated_deliverables = {}
+            st.session_state.workflow_type = None
 
             # Streamlit live progress container
             trace_container = st.empty()
@@ -362,15 +387,6 @@ if st.session_state.current_plan:
                 }
                 event_log.append(evt)
                 st.session_state.execution_events.append(evt)
-
-                # Format color-coded live console
-                color_class = {
-                    "MODEL": "trace-model",
-                    "TOOL": "trace-tool",
-                    "STEP": "trace-step",
-                    "ERROR": "trace-error",
-                    "STATUS": "trace-status",
-                }.get(tag, "")
 
                 # Render recent events in real time
                 lines_html = []
@@ -399,20 +415,57 @@ if st.session_state.current_plan:
                 else:
                     status_box.update(label=f"Workflow failed: {result.error}", state="error", expanded=True)
 
-            # Check if findings.json was generated or modified
-            findings_file = "findings.json"
-            for step_res in result.step_results:
-                if "findings_path" in step_res.outputs and os.path.isfile(step_res.outputs["findings_path"]):
-                    findings_file = step_res.outputs["findings_path"]
-                if "answer" in step_res.outputs:
-                    st.session_state.chat_answer = step_res.outputs["answer"]
+            # Determine workflow type based strictly on steps in plan
+            executed_caps = [s.get("capability") for s in plan.get("steps", [])]
+            has_finance = any(c in executed_caps for c in ("extract_requirements", "check_report", "build_report"))
+            has_chat = "answer_locally" in executed_caps
 
-            if os.path.isfile(findings_file):
-                try:
-                    with open(findings_file) as f:
-                        st.session_state.findings_data = json.load(f)
-                except Exception:
-                    st.session_state.findings_data = None
+            st.session_state.findings_data = None
+            st.session_state.chat_answer = None
+            st.session_state.generated_deliverables = {}
+
+            if has_finance:
+                st.session_state.workflow_type = "finance"
+                deliverables = {}
+                for step_res in result.step_results:
+                    if not step_res.success:
+                        continue
+                    if step_res.capability == "check_report":
+                        if "findings_data" in step_res.outputs and step_res.outputs["findings_data"]:
+                            st.session_state.findings_data = step_res.outputs["findings_data"]
+                        elif "findings_path" in step_res.outputs and os.path.isfile(step_res.outputs["findings_path"]):
+                            try:
+                                with open(step_res.outputs["findings_path"]) as f:
+                                    st.session_state.findings_data = json.load(f)
+                            except Exception:
+                                pass
+                        if "findings_path" in step_res.outputs and os.path.isfile(step_res.outputs["findings_path"]):
+                            deliverables["findings"] = step_res.outputs["findings_path"]
+
+                    elif step_res.capability == "build_report":
+                        if "artifact_path" in step_res.outputs and os.path.isfile(step_res.outputs["artifact_path"]):
+                            deliverables["docx"] = step_res.outputs["artifact_path"]
+
+                    elif step_res.capability == "extract_requirements":
+                        if "requirements_path" in step_res.outputs and os.path.isfile(step_res.outputs["requirements_path"]):
+                            deliverables["requirements"] = step_res.outputs["requirements_path"]
+
+                # Also inspect result.artifact_paths for any additional artifacts from this execution
+                for p in result.artifact_paths:
+                    if p.endswith(".docx") and os.path.isfile(p):
+                        deliverables["docx"] = p
+                    elif p.endswith("findings.json") and os.path.isfile(p):
+                        deliverables["findings"] = p
+                    elif p.endswith("requirements.json") and os.path.isfile(p):
+                        deliverables["requirements"] = p
+
+                st.session_state.generated_deliverables = deliverables
+
+            if has_chat:
+                st.session_state.workflow_type = "chat"
+                for step_res in result.step_results:
+                    if step_res.capability == "answer_locally" and step_res.success and "answer" in step_res.outputs:
+                        st.session_state.chat_answer = step_res.outputs["answer"]
 
             st.rerun()
 
@@ -429,11 +482,11 @@ if st.session_state.execution_result:
 
         # 1. General Chat Output
         if st.session_state.chat_answer:
-            st.markdown("#### Model Response")
+            st.markdown("#### 💬 Model Response")
             st.markdown(f"> {st.session_state.chat_answer}")
 
-        # 2. Finance Analysis Output
-        if st.session_state.findings_data:
+        # 2. Finance Analysis Output (ONLY shown for finance workflow, NEVER for chat)
+        if st.session_state.findings_data and st.session_state.workflow_type != "chat":
             findings = st.session_state.findings_data
             summary = ui_utils.parse_findings_summary(findings)
 
@@ -448,47 +501,42 @@ if st.session_state.execution_result:
             # Draft Warning
             st.warning("⚠ **DRAFT FOR HUMAN REVIEW** — This compliance report was prepared by local AI inference. Human audit is required before reliance.")
 
-            # Artifact Downloads
-            st.markdown("#### Generated Deliverables")
-            docx_path = os.path.join(PROJECT_DIR, "Gap_Register.docx")
-            for p in res.artifact_paths:
-                if p.endswith(".docx") and os.path.isfile(p):
-                    docx_path = p
-
-            col_d1, col_d2, col_d3 = st.columns(3)
-            with col_d1:
-                if os.path.isfile(docx_path):
-                    with open(docx_path, "rb") as f:
-                        st.download_button(
-                            label="⬇ Download Gap_Register.docx",
-                            data=f.read(),
-                            file_name="Gap_Register.docx",
-                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                            type="primary",
-                            use_container_width=True,
-                        )
-            with col_d2:
-                findings_json_path = os.path.join(PROJECT_DIR, "findings.json")
-                if os.path.isfile(findings_json_path):
-                    with open(findings_json_path, "rb") as f:
-                        st.download_button(
-                            label="⬇ Download findings.json",
-                            data=f.read(),
-                            file_name="findings.json",
-                            mime="application/json",
-                            use_container_width=True,
-                        )
-            with col_d3:
-                reqs_json_path = os.path.join(PROJECT_DIR, "requirements.json")
-                if os.path.isfile(reqs_json_path):
-                    with open(reqs_json_path, "rb") as f:
-                        st.download_button(
-                            label="⬇ Download requirements.json",
-                            data=f.read(),
-                            file_name="requirements.json",
-                            mime="application/json",
-                            use_container_width=True,
-                        )
+            # Artifact Downloads (ONLY for deliverables generated in this specific run)
+            deliverables = st.session_state.get("generated_deliverables", {})
+            if deliverables:
+                st.markdown("#### Generated Deliverables")
+                col_d1, col_d2, col_d3 = st.columns(3)
+                if "docx" in deliverables and os.path.isfile(deliverables["docx"]):
+                    with col_d1:
+                        with open(deliverables["docx"], "rb") as f:
+                            st.download_button(
+                                label="⬇ Download Gap_Register.docx",
+                                data=f.read(),
+                                file_name=os.path.basename(deliverables["docx"]),
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                type="primary",
+                                use_container_width=True,
+                            )
+                if "findings" in deliverables and os.path.isfile(deliverables["findings"]):
+                    with col_d2:
+                        with open(deliverables["findings"], "rb") as f:
+                            st.download_button(
+                                label="⬇ Download findings.json",
+                                data=f.read(),
+                                file_name=os.path.basename(deliverables["findings"]),
+                                mime="application/json",
+                                use_container_width=True,
+                            )
+                if "requirements" in deliverables and os.path.isfile(deliverables["requirements"]):
+                    with col_d3:
+                        with open(deliverables["requirements"], "rb") as f:
+                            st.download_button(
+                                label="⬇ Download requirements.json",
+                                data=f.read(),
+                                file_name=os.path.basename(deliverables["requirements"]),
+                                mime="application/json",
+                                use_container_width=True,
+                            )
 
             # Interactive Findings Explorer
             st.markdown("#### Findings Explorer")
